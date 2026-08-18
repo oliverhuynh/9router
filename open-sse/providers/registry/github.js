@@ -21,21 +21,21 @@ export default {
     messagesUrl: "https://api.githubcopilot.com/v1/messages",
     headers: {
       "copilot-integration-id": "vscode-chat",
-      "editor-version": "vscode/1.110.0",
-      "editor-plugin-version": "copilot-chat/0.38.0",
-      "user-agent": "GitHubCopilotChat/0.38.0",
-      "openai-intent": "conversation-panel",
-      "x-github-api-version": "2025-04-01",
+      "editor-version": "vscode/1.120.0",
+      "editor-plugin-version": "copilot-chat/0.58.0",
+      "user-agent": "GitHubCopilotChat/0.58.0",
+      "openai-intent": "conversation-agent",
+      "x-github-api-version": "2026-06-01",
       "x-vscode-user-agent-library-version": "electron-fetch",
       "X-Initiator": "user",
       Accept: "application/json",
       "Content-Type": "application/json",
     },
     copilot: {
-      vscodeVersion: "1.110.0",
-      chatVersion: "0.38.0",
-      userAgent: "GitHubCopilotChat/0.38.0",
-      apiVersion: "2025-04-01",
+      vscodeVersion: "1.120.0",
+      chatVersion: "0.58.0",
+      userAgent: "GitHubCopilotChat/0.58.0",
+      apiVersion: "2026-06-01",
     },
     usage: {
       url: "https://api.github.com/copilot_internal/user",
@@ -46,7 +46,7 @@ export default {
     // Listed first so it is the default for connection tests and model selector.
     // Free-tier users MUST use this model — premium models (gpt-5.x, claude-opus, etc.)
     // return 403 on free accounts. Paid users can select any model below.
-    { id: "goldeneye-free-auto", name: "GoldenEye (Auto)" },
+    { id: "auto", name: "Auto" },
     { id: "gpt-5.2", name: "GPT-5.2" },
     { id: "gpt-5.2-codex", name: "GPT-5.2 Codex" },
     { id: "gpt-5.3-codex", name: "GPT-5.3 Codex" },

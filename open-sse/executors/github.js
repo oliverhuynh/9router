@@ -12,11 +12,186 @@ import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import crypto from "crypto";
+import { CAPIClient, RequestType } from "@vscode/copilot-api";
 
 export class GithubExecutor extends BaseExecutor {
   constructor() {
     super("github", PROVIDERS.github);
     this.knownCodexModels = new Set();
+
+    // @vscode/copilot-api expects editor identity metadata. Keep it stable for
+    // the lifetime of this executor, similar to a VS Code process/session.
+    this.capiEditorDetails = {
+      machineId: crypto.randomUUID(),
+      deviceId: crypto.randomUUID(),
+      sessionId: crypto.randomUUID(),
+      vscodeVersion: GITHUB_COPILOT.VSCODE_VERSION,
+      buildType: "prod",
+      name: "copilot-chat",
+      version: GITHUB_COPILOT.COPILOT_CHAT_VERSION,
+    };
+  }
+
+  extractAutoPrompt(body) {
+    if (!body) return "";
+
+    if (typeof body.input === "string") {
+      return body.input;
+    }
+
+    if (Array.isArray(body.messages)) {
+      const userMessage = [...body.messages]
+        .reverse()
+        .find((m) => m?.role === "user");
+
+      if (userMessage) {
+        if (typeof userMessage.content === "string") {
+          return userMessage.content;
+        }
+
+        if (Array.isArray(userMessage.content)) {
+          return userMessage.content
+            .filter((p) => p?.type === "text")
+            .map((p) => p.text || "")
+            .filter(Boolean)
+            .join("\n");
+        }
+      }
+    }
+
+    return "";
+  }
+
+  createCopilotApiFetcher(proxyOptions = null) {
+    return {
+      fetch: async (url, options = {}) => {
+        let body = options.body;
+
+        // @vscode/copilot-api may supply a JSON value instead of a pre-encoded body.
+        if (body === undefined && options.json !== undefined) {
+          body = JSON.stringify(options.json);
+        }
+
+        return proxyAwareFetch(
+          url,
+          {
+            method: options.method || "GET",
+            headers: options.headers,
+            body,
+            signal: options.signal,
+          },
+          proxyOptions
+        );
+      },
+    };
+  }
+
+  createCopilotApiClient(proxyOptions = null) {
+    // Match VS Code's CAPIClient construction pattern. The library owns the
+    // request-type -> endpoint/API-version mapping; 9router only provides the
+    // transport so existing proxy support remains intact.
+    // Do not pass a reserved VS Code integration ID here. The public
+    // @vscode/copilot-api API supports constructing CAPIClient without one.
+    return new CAPIClient(
+      this.capiEditorDetails,
+      undefined,
+      this.createCopilotApiFetcher(proxyOptions)
+    );
+  }
+
+  async resolveAutoModel(credentials, body, log, proxyOptions = null, signal = undefined) {
+    const token = credentials.copilotToken || credentials.accessToken;
+    const prompt = this.extractAutoPrompt(body);
+
+    if (!token) {
+      throw new Error("GitHub Copilot Auto requires a Copilot token");
+    }
+
+    if (!prompt) {
+      throw new Error("GitHub Copilot Auto requires a user prompt");
+    }
+
+    if (!RequestType?.Auto) {
+      throw new Error(
+        "Installed @vscode/copilot-api does not expose RequestType.Auto; use the same package version as current VS Code Copilot"
+      );
+    }
+
+    const client = this.createCopilotApiClient(proxyOptions);
+
+    log?.info?.("GITHUB", "Resolving Auto via @vscode/copilot-api RequestType.Auto");
+
+    // Deliberately do NOT construct /auto or set x-github-api-version here.
+    // CAPIClient owns both pieces, exactly as VS Code's AutoV2Fetcher does.
+    const response = await client.makeRequest(
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`,
+        },
+        body: JSON.stringify({ prompt }),
+        signal,
+      },
+      { type: RequestType.Auto }
+    );
+
+    if (!response?.ok) {
+      let detail = "";
+      try {
+        const errorData = await response?.json?.();
+        detail = errorData ? JSON.stringify(errorData) : "";
+      } catch {
+        try {
+          detail = await response?.text?.();
+        } catch {
+          // Ignore secondary error while formatting the upstream failure.
+        }
+      }
+
+      throw new Error(
+        `Copilot Auto failed: ${response?.status ?? "unknown"}` +
+          (detail ? `: ${detail}` : "")
+      );
+    }
+
+    const data = await response.json();
+
+    const selectedModel =
+      typeof data.selected_model === "string"
+        ? data.selected_model
+        : data.selected_model?.id;
+
+    if (!selectedModel) {
+      throw new Error(
+        `Copilot Auto returned no selected_model: ${JSON.stringify(data)}`
+      );
+    }
+
+    if (!data.session_token) {
+      throw new Error(
+        `Copilot Auto returned no session_token: ${JSON.stringify(data)}`
+      );
+    }
+
+    const supportedEndpoints =
+      Array.isArray(data.selected_model?.supported_endpoints)
+        ? data.selected_model.supported_endpoints
+        : [];
+
+    log?.info?.(
+      "GITHUB",
+      `Auto resolved to ${selectedModel}` +
+        (supportedEndpoints.length
+          ? ` | endpoints=${supportedEndpoints.join(",")}`
+          : "")
+    );
+
+    return {
+      model: selectedModel,
+      sessionToken: data.session_token,
+      supportedEndpoints,
+    };
   }
 
   // Claude models get routed to Copilot's Anthropic-native /v1/messages shim (see
@@ -35,22 +210,33 @@ export class GithubExecutor extends BaseExecutor {
 
   buildHeaders(credentials, stream = true) {
     const token = credentials.copilotToken || credentials.accessToken;
-    return {
+    const requestId = crypto.randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const headers = {
       "Authorization": `Bearer ${token}`,
       "Content-Type": "application/json",
       "copilot-integration-id": "vscode-chat",
       "editor-version": `vscode/${GITHUB_COPILOT.VSCODE_VERSION}`,
       "editor-plugin-version": `copilot-chat/${GITHUB_COPILOT.COPILOT_CHAT_VERSION}`,
       "user-agent": GITHUB_COPILOT.USER_AGENT,
-      "openai-intent": "conversation-panel",
+      "openai-intent": "conversation-agent",
       "x-github-api-version": GITHUB_COPILOT.API_VERSION,
-      "x-request-id": crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      "x-request-id": requestId,
+      "x-agent-task-id": requestId,
+      "x-interaction-type": "conversation-agent",
       "x-vscode-user-agent-library-version": "electron-fetch",
       "X-Initiator": "user",
-      // Harmless no-op on /chat/completions and /responses; required by /v1/messages.
       "anthropic-version": ANTHROPIC_API_VERSION,
-      "Accept": stream ? "text/event-stream" : "application/json"
+      "Accept": stream ? "text/event-stream" : "application/json",
     };
+
+    if (credentials.copilotSessionToken) {
+      headers["Copilot-Session-Token"] =
+        credentials.copilotSessionToken;
+    }
+
+    return headers;
   }
 
   // Sanitize messages for GitHub Copilot /chat/completions endpoint (gpt/gemini/grok models —
@@ -122,6 +308,36 @@ export class GithubExecutor extends BaseExecutor {
 
   async execute(options) {
     const { model, log } = options;
+
+    if (model === "auto") {
+      const resolved = await this.resolveAutoModel(
+        options.credentials,
+        options.body,
+        log,
+        options.proxyOptions || null,
+        options.signal
+      );
+
+      // Avoid first trying /chat/completions when Auto tells us
+      // the selected model is Responses-only.
+      if (
+        resolved.supportedEndpoints.includes("/responses") &&
+        !resolved.supportedEndpoints.includes("/chat/completions")
+      ) {
+        this.knownCodexModels.add(resolved.model);
+      }
+
+      return this.execute({
+        ...options,
+
+        model: resolved.model,
+
+        credentials: {
+          ...options.credentials,
+          copilotSessionToken: resolved.sessionToken,
+        },
+      });
+    }
 
     // Claude models: route to Copilot's Anthropic-native /v1/messages shim — the only
     // Copilot endpoint that surfaces prompt-cache token counts for Claude. Detected by
