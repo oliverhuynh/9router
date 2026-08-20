@@ -37,6 +37,19 @@ export function filterToOpenAIFormat(body, opts = {}) {
         // Skip thinking blocks
         if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) continue;
 
+        // Responses API input_file is valid input, but Chat Completions uses the
+        // equivalent {type:"file", file:{...}} block. Convert it before the
+        // OpenAI whitelist so Responses→Chat routes do not silently drop files.
+        if (block.type === "input_file") {
+          const file = {};
+          if (block.file_data !== undefined) file.file_data = block.file_data;
+          if (block.file_id !== undefined) file.file_id = block.file_id;
+          if (block.file_url !== undefined) file.file_url = block.file_url;
+          if (block.filename !== undefined) file.filename = block.filename;
+          filteredContent.push({ type: OPENAI_BLOCK.FILE, file });
+          continue;
+        }
+
         // Only keep valid OpenAI content types
         if (VALID_OPENAI_CONTENT_TYPES.includes(block.type)) {
           filteredContent.push(stripBlock(block));
